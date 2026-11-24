@@ -11,7 +11,10 @@ import os
 import sys
 from pathlib import Path
 
+CONFIG_VERSION = 2
+
 DEFAULTS: dict = {
+    "config_version": CONFIG_VERSION,
     # ---------------------------------------------------------------- account
     "mode": "paper",                 # only "paper" is implemented; no real funds move
     "start_balance_eur": 50.0,
@@ -19,14 +22,48 @@ DEFAULTS: dict = {
     "open_browser": True,
     "active_hours": None,            # e.g. [23, 7] to only open trades 23:00-07:00 local; None = always
 
+    # ------------------------------------------------------------- strategies
+    # copy     : mirror buys of proven wallets (good win rate + PnL, small enough to fit 50 EUR)
+    # migrated : coins that graduated from pump.fun / launchpads to a real DEX pool
+    # fresh    : brand-new pairs (< 6h). Off by default.
+    "strategies": {"copy": True, "migrated": True, "fresh": False},
+
     # --------------------------------------------------------------- universe
     "universe": {
-        "max_pair_age_hours": 6,     # launched / migrated in the last 6h
-        "min_liquidity_usd": 40000,
-        "min_volume_m5_usd": 25000,
-        "min_holders": 300,
-        "max_mcap_usd": 20000000,
-        "dex_ids": ["raydium", "pumpswap", "meteora", "pumpfun", "orca", "launchlab", "meteoradbc"],
+        "fresh": {
+            "max_pair_age_hours": 6,
+            "min_liquidity_usd": 40000,
+            "min_volume_m5_usd": 25000,
+            "min_holders": 300,
+            "min_mcap_usd": 0,
+            "max_mcap_usd": 20000000,
+            "dex_ids": ["raydium", "pumpswap", "meteora", "pumpfun", "orca", "launchlab", "meteoradbc"],
+        },
+        "migrated": {
+            "max_pair_age_hours": 168,   # migrated within the last 7 days
+            "min_liquidity_usd": 30000,
+            "min_volume_m5_usd": 5000,
+            "min_holders": 500,
+            "min_mcap_usd": 150000,
+            "max_mcap_usd": 50000000,
+            "dex_ids": ["pumpswap", "raydium", "meteora", "orca"],
+        },
+        "copy": {
+            "max_pair_age_hours": 720,
+            "min_liquidity_usd": 20000,
+            "min_volume_m5_usd": 0,
+            "min_holders": 150,
+            "min_mcap_usd": 50000,
+            "max_mcap_usd": 100000000,
+            "dex_ids": [],
+        },
+    },
+
+    # per-strategy exit overrides (on top of "executor")
+    "exits": {
+        "fresh": {},
+        "migrated": {"time_stop_min": 90, "hard_stop_pct": 15.0},
+        "copy": {"time_stop_min": 360, "hard_stop_pct": 20.0},
     },
 
     # ---------------------------------------------------------------- scanner
@@ -89,20 +126,30 @@ DEFAULTS: dict = {
     "wallets": {
         "interval_sec": 30,
         "tracked": ["BdLxn8cYq3FHNUqEN9dE2CYz2wc7BwCjL3gDrpsQRZ7y"],
-        # "fits my balance": no whales. A wallet is copyable when:
-        "max_wallet_sol": 60.0,        # total SOL balance at most this
+        "copy_mode": "mirror",         # "mirror" = enter when a copy wallet buys (rug check still applies)
+                                       # "signal" = a copy-wallet buy only counts as one scanner signal
+        "mirror_sells": True,          # exit when the wallet we copied sells that coin
+        "mirror_max_delay_sec": 180,   # ignore buys we notice later than this (price already moved)
+        # "fits my balance" - no whales:
+        "max_wallet_sol": 60.0,
         "min_median_buy_sol": 0.02,
-        "max_median_buy_sol": 3.0,     # median buy size at most this
-        "copy_mode": "signal",         # "signal" = a fitted wallet buy is a scanner signal; "mirror" = enter on its buy (still rug-checked)
-        "auto_discover": True,         # learn new small wallets from early buyers of tokens that ran
+        "max_median_buy_sol": 3.0,
+        # "good wallet" - measured from its own on-chain trades:
+        "min_closed_trades": 6,
+        "min_winrate": 0.55,
+        "min_pnl_sol": 0.5,
+        "max_trades_per_day": 300,     # more = bot / MEV
+        "min_median_hold_sec": 20,     # less = sniper bot
+        "profile_tx": 80,              # transactions read when profiling a wallet
+        "auto_discover": True,         # find wallets: GMGN leaderboard + top traders of coins that ran
+        "discover_every_min": 10,
         "max_tracked": 40,
-        "promote_after_obs": 5,        # discovered wallets need 5 observed buys ...
-        "promote_hit_rate": 0.5,       # ... with >=50% of them up 30 min later
     },
 
     # -------------------------------------------------------- data sources
     "sources": {
         "dexscreener": True,
+        "jupiter_trending": True,
         "pumpfun": True,
         "gmgn": True,                 # best effort: gmgn.ai is behind Cloudflare and may refuse
         "news_rss": [
@@ -140,7 +187,13 @@ def load_config(path: Path | None = None) -> dict:
     if path.exists():
         with open(path, "r", encoding="utf-8") as f:
             user = json.load(f)
-        return _merge(DEFAULTS, user)
+        if user.get("config_version", 1) >= CONFIG_VERSION:
+            return _merge(DEFAULTS, user)
+        # settings layout changed: keep the old file as a backup and write the new defaults
+        try:
+            path.replace(path.with_name(f"config.v{user.get('config_version', 1)}.bak.json"))
+        except OSError:
+            pass
     try:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(DEFAULTS, f, indent=2)

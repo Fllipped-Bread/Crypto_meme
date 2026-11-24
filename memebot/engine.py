@@ -10,7 +10,7 @@ from pathlib import Path
 from . import agents
 from .agents import Journal, PaperBook, f
 from .net import health
-from .sources import dexscreener, fx, gmgn, news, pumpfun, rugcheck, solana
+from .sources import dexscreener, fx, gmgn, jupiter, news, pumpfun, rugcheck, solana
 from .wallets import WalletBook
 
 
@@ -120,6 +120,8 @@ class Engine:
 
         if src["dexscreener"]:
             merge(dexscreener.discover())
+        if src.get("jupiter_trending"):
+            merge(jupiter.trending())
         if src["pumpfun"]:
             t, info = pumpfun.discover()
             merge(t)
@@ -151,18 +153,27 @@ class Engine:
                  "liq": f((pair.get("liquidity") or {}).get("usd")), "v5": f((pair.get("volume") or {}).get("m5")),
                  "h1": f((pair.get("priceChange") or {}).get("h1")), "m5": f((pair.get("priceChange") or {}).get("m5")),
                  "age_h": agents.pair_age_hours(pair), "tags": sorted(tags.get(mint, [])), "signals": [],
-                 "stage": "scanned", "note": "", "pair": pair}
+                 "stage": "scanned", "note": "", "pair": pair, "strategy": None,
+                 "h6": f((pair.get("priceChange") or {}).get("h6")), "migrated": agents.is_migrated(pair)}
             cands.append(c)
-            why = agents.universe_check(pair, cfg)
-            if why:
+            # coins that ran are where good traders are: queue them for wallet discovery
+            if c["migrated"] and c["liq"] >= 30000 and (c["h6"] >= 100 or c["h1"] >= 60) and pair.get("pairAddress"):
+                self.wallets.queue_runner(pair["pairAddress"], mint, sym)
+            strat, why = agents.pick_strategy(pair, cfg)
+            if not strat:
                 c["stage"], c["note"] = "out", why
                 continue
+            c["strategy"] = strat
             sig = agents.momentum_signals(pair, cfg)
             t = tags.get(mint, set())
             if t & {"dex_boost", "dex_top_boost", "gmgn_kol"}:
                 sig.append("kol_boost")
             if "gmgn_smart_money" in t:
                 sig.append("smart_money")
+            if "jup_trending" in t:
+                sig.append("trending")
+            if strat == "migrated" and "pump_graduated" in t and (c["age_h"] or 99) <= 1:
+                sig.append("fresh_migration")
             buyers = self.wallets.buyers_within(mint, cfg["scanner"]["smart_money_window_min"])
             if len({b["wallet"] for b in buyers}) >= cfg["scanner"]["smart_money_min_wallets"]:
                 sig.append("copy_wallet")
@@ -209,6 +220,7 @@ class Engine:
         if time.time() - self.book.cooldown.get(mint, 0) < 3600:
             c["stage"], c["note"] = "rejected", "cooldown after exit"
             return
+        strategy = c.get("strategy") or "fresh"
         chase = agents.no_chase(c["pair"], cfg)
         if chase:
             c["stage"], c["note"] = "rejected", chase
@@ -219,7 +231,7 @@ class Engine:
         rep, sellable = c.get("safety"), c.get("sellable")
         if rep is None:
             rep, sellable = self.safety(mint)
-        ok, why = agents.rug_gate(rep, cfg, sellable, cfg["universe"]["min_holders"])
+        ok, why = agents.rug_gate(rep, cfg, sellable, cfg["universe"][strategy]["min_holders"])
         if not ok:
             c["stage"], c["note"] = "rejected", why
             if self.j.log_once("FILTERED", why, sym, mint, signals=",".join(c["signals"])):
@@ -243,7 +255,7 @@ class Engine:
             self.j.log_once("SKIP", note, sym, mint)
             return
         reason = f"{' + '.join(c['signals'])} · {why}"
-        pos = self.book.open(c["pair"], size, c["signals"], reason, rep)
+        pos = self.book.open(c["pair"], size, c["signals"], reason, rep, strategy, c.get("copied_from"))
         if pos:
             open_mints.add(mint)
             c["stage"], c["note"] = "entered", f"€{size:.2f} ({note})"
@@ -272,8 +284,7 @@ class Engine:
             if closed:
                 self._set("executor", "flat", f"closed ${p['symbol']}: {closed}")
                 if closed in ("ladder complete", "trailing stop") and p.get("pair"):
-                    threading.Thread(target=self.wallets.discover_from_pair, args=(p["pair"], p["mint"]),
-                                     daemon=True).start()
+                    self.wallets.queue_runner(p["pair"], p["mint"], p["symbol"])
                 self.save()
         if self.book.positions:
             s = ", ".join(f"${p['symbol']} {p['last_price'] / p['entry_price']:.2f}x" for p in self.book.positions.values())
@@ -317,27 +328,40 @@ class Engine:
 
     def _wallet_tick(self) -> None:
         self._set("wallets", "scan", f"polling {len(self.wallets.w)} wallets")
-        buys = self.wallets.poll_once()
+        buys, sells = self.wallets.poll_once()
         for b in buys:
-            self.j.log("COPY", f"tracked wallet {b['wallet'][:4]}…{b['wallet'][-4:]} bought {b['sol']} SOL",
-                       mint=b["mint"])
-            if self.cfg["wallets"]["copy_mode"] == "mirror":
+            self.j.log("COPY", f"copy wallet {b['wallet'][:4]}…{b['wallet'][-4:]} bought {b['sol']} SOL "
+                               f"({(b['pct_of_balance'] or 0) * 100:.1f}% of its balance)", mint=b["mint"])
+            if self.cfg["strategies"].get("copy") and self.cfg["wallets"]["copy_mode"] == "mirror":
                 self._mirror(b)
-        self._set("wallets", "idle", f"{len(self.wallets.copyable())} copyable / {len(self.wallets.w)} tracked")
+        if self.cfg["wallets"]["mirror_sells"]:
+            for sl in sells:
+                for p in list(self.book.positions.values()):
+                    if p["mint"] == sl["mint"] and p.get("copied_from") == sl["wallet"]:
+                        self.book.force_close(p["id"], f"copied wallet {sl['wallet'][:4]}… sold")
+                        self.save()
+        self.wallets.discover_tick()
+        self._set("wallets", "idle", f"{len(self.wallets.copyable())} copyable / {len(self.wallets.w)} tracked"
+                                     f" · {len(self.wallets.discovery_queue)} runners to mine")
 
     def _mirror(self, buy: dict) -> None:
+        if time.time() - buy["ts"] > self.cfg["wallets"]["mirror_max_delay_sec"]:
+            self.j.log_once("SKIP", f"copy buy seen {time.time() - buy['ts']:.0f}s late", mint=buy["mint"])
+            return
         pairs = dexscreener.best_pairs(dexscreener.pairs_for_tokens([buy["mint"]]))
         pair = pairs.get(buy["mint"])
         if not pair:
             return
-        liq = f((pair.get("liquidity") or {}).get("usd"))
-        if liq < self.cfg["universe"]["min_liquidity_usd"]:
-            self.j.log_once("FILTERED", f"copy skipped: liquidity ${liq:,.0f}", pair["baseToken"].get("symbol", ""), buy["mint"])
+        sym = pair["baseToken"].get("symbol", "?")
+        why = agents.universe_check(pair, self.cfg["universe"]["copy"])
+        if why:
+            self.j.log_once("FILTERED", f"copy skipped: {why}", sym, buy["mint"])
             return
-        c = {"mint": buy["mint"], "symbol": pair["baseToken"].get("symbol", "?"), "pair": pair,
-             "signals": ["copy_wallet", "mirror"], "stage": "flagged"}
-        with self.book.lock:
-            self.consider(c, {p["mint"] for p in self.book.positions.values()}, override_pct=buy.get("pct_of_balance"))
+        n_wallets = len({b["wallet"] for b in self.wallets.buyers_within(buy["mint"], 10)})
+        c = {"mint": buy["mint"], "symbol": sym, "pair": pair, "strategy": "copy",
+             "signals": ["copy_wallet"] + (["smart_cluster"] if n_wallets >= 2 else []) + ["mirror"],
+             "stage": "flagged", "copied_from": buy["wallet"]}
+        self.consider(c, {p["mint"] for p in self.book.positions.values()}, override_pct=buy.get("pct_of_balance"))
 
     def start(self) -> None:
         sc = self.cfg
@@ -369,5 +393,6 @@ class Engine:
             "trades": trades, "curve": curve, "log": self.j.recent(150), "candidates": cands,
             "checked": self.checked, "filtered": self.filtered, "wallets": self.wallets.snapshot(),
             "sources": health.snapshot(), "headlines": self.headlines[:12], "recap": self.recap,
-            "config": {k: self.cfg[k] for k in ("universe", "scanner", "rugcheck", "sizer", "executor", "risk")},
+            "config": {k: self.cfg[k] for k in ("strategies", "universe", "scanner", "rugcheck", "sizer", "executor",
+                                                 "exits", "risk", "wallets")},
         }

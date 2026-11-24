@@ -32,11 +32,30 @@ SAFE = {"mint_authority": None, "freeze_authority": None, "top10_pct": 20, "dev_
 
 
 def test_universe_filters():
-    c = cfg()
-    assert agents.universe_check(pair(), c) is None
-    assert "age" in agents.universe_check(pair(age_h=7), c)
-    assert "liquidity" in agents.universe_check(pair(liq=10_000), c)
-    assert "5m volume" in agents.universe_check(pair(v5=1000), c)
+    u = cfg()["universe"]["fresh"]
+    assert agents.universe_check(pair(), u) is None
+    assert "age" in agents.universe_check(pair(age_h=7), u)
+    assert "liquidity" in agents.universe_check(pair(liq=10_000), u)
+    assert "5m volume" in agents.universe_check(pair(v5=1000), u)
+
+
+def test_strategy_selection_migrated_not_fresh():
+    c = cfg()  # defaults: fresh off, migrated on
+    assert agents.pick_strategy(pair(age_h=30, v5=8000), c)[0] == "migrated"
+    strat, why = agents.pick_strategy(pair(age_h=30, v5=8000, dex="pumpfun"), c)
+    assert strat is None and "bonding curve" in why
+    assert agents.pick_strategy(pair(age_h=500), c)[0] is None          # migrated > 7 days ago
+    c["strategies"]["fresh"] = True
+    assert agents.pick_strategy(pair(age_h=1), c)[0] == "fresh"
+
+
+def test_copy_positions_use_wider_exits():
+    b = make_book()
+    p = b.open(pair(), 10.0, ["copy_wallet"], "t", SAFE, strategy="copy", copied_from="W")
+    assert b.update(p["id"], p["entry_price"] * 0.86, 80_000) is None   # -14%: inside the copy stop of -20%
+    assert b.update(p["id"], p["entry_price"] * 1.1, 80_000, now=time.time() + 60 * 60) is None  # no 25 min time stop
+    assert b.update(p["id"], p["entry_price"] * 0.79, 80_000) == "hard stop"
+    assert b.trades[-1]["copied_from"] == "W"
 
 
 def test_momentum_signals():
@@ -158,21 +177,45 @@ def test_parse_swaps_buy_and_sell():
     assert sell[0]["side"] == "sell" and sell[0]["sol"] == pytest.approx(0.8)
 
 
+def _swaps(results, buy_sol=0.5, hold=600, t0=1_700_000_000):
+    out = []
+    for i, mult in enumerate(results):
+        m = f"M{i}"
+        out.append({"mint": m, "side": "buy", "sol": buy_sol, "tokens": 1000, "ts": t0 + i * 3600})
+        out.append({"mint": m, "side": "sell", "sol": buy_sol * mult, "tokens": 1000, "ts": t0 + i * 3600 + hold})
+    return out
+
+
+def test_trade_stats_winrate_pnl():
+    from memebot.wallets import trade_stats
+    st = trade_stats(_swaps([2.0, 0.5, 1.5, 3.0]), now=1_700_000_000 + 86400 * 2)
+    assert st["closed"] == 4 and st["wins"] == 3 and st["winrate"] == 0.75
+    assert st["pnl_sol"] == pytest.approx(0.5 * (1.0 - 0.5 + 0.5 + 2.0))
+    assert st["median_buy"] == 0.5 and st["median_hold_s"] == 600
+    # a sell of a coin bought before the history window is ignored
+    st = trade_stats([{"mint": "X", "side": "sell", "sol": 5, "tokens": 10, "ts": 1}])
+    assert st["closed"] == 0
+
+
 def test_wallet_classification():
     from memebot.wallets import WalletBook
     c = cfg()
     wb = WalletBook(c, agents.Journal())
-    w = wb.w[c["wallets"]["tracked"][0]]
-    w["sol"] = 12.0
-    w["buys"] = [{"sol": 0.3}, {"sol": 0.5}, {"sol": 0.4}]
+    good = _swaps([2, 1.5, 0.7, 2.5, 1.2, 3, 0.8, 1.6])          # 6/8 wins, +PnL
+    wb.add("Good111111111111111111111111111111111111", "gmgn")
+    w = wb.w["Good111111111111111111111111111111111111"]
+    w.update(sol=12.0, swaps=good, profiled=True)
     assert wb.classify(w) == "copy"
-    w["sol"] = 900.0
+    w["swaps"] = _swaps([0.5, 0.6, 2, 0.4, 0.3, 0.8, 0.9, 0.7])   # 1/8 wins
+    assert wb.classify(w) == "poor"
+    w["swaps"] = good[:4]
+    assert wb.classify(w) == "watch"                               # too few closed trades
+    w.update(swaps=good, sol=900.0)
+    assert wb.classify(w) == "whale"                               # too big for a 50 EUR account
+    w.update(sol=12.0, swaps=_swaps([2] * 8, buy_sol=25))
     assert wb.classify(w) == "whale"
-    w["sol"], w["buys"] = 12.0, [{"sol": 25.0}] * 3
-    assert wb.classify(w) == "whale"
-    wb.add("Disc1111111111111111111111111111111111111", "early buyer")
-    d = wb.w["Disc1111111111111111111111111111111111111"]
-    d.update(sol=5.0, buys=[{"sol": 0.2}], obs=6, hits=4)
-    assert wb.classify(d) == "copy"
-    d.update(hits=1)
-    assert wb.classify(d) == "watch"
+    w["swaps"] = _swaps([2] * 8, hold=3)
+    assert wb.classify(w) == "bot"                                 # sniper: holds for seconds
+    m = wb.w[c["wallets"]["tracked"][0]]
+    m.update(sol=5.0, profiled=True)
+    assert wb.classify(m) == "copy"                                # your own wallet, no data yet

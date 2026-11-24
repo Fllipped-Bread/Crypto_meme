@@ -39,3 +39,13 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/MemeBot.exe
+      - name: Publish rolling "latest" download (used by install-desktop.ps1)
+        if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          target_commitish: ${{ github.sha }}
+          name: MemeBot (latest build)
+          body: Newest automatic build. Paper trading only.
+          prerelease: true
+          files: dist/MemeBot.exe

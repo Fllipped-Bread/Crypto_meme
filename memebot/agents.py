@@ -74,9 +74,16 @@ def pair_age_hours(pair: dict, now: float | None = None) -> float | None:
     return ((now or time.time()) - created / 1000) / 3600
 
 
-def universe_check(pair: dict, cfg: dict, now: float | None = None) -> str | None:
-    """None if the pair is in the tradeable universe, else the reason it is not."""
-    u = cfg["universe"]
+BONDING_CURVE_DEXES = {"pumpfun", "launchlab", "meteoradbc", "moonshot", "boop", "believe"}
+
+
+def is_migrated(pair: dict) -> bool:
+    """True once a launchpad coin trades in a real DEX pool (not on its bonding curve)."""
+    return pair.get("dexId", "") not in BONDING_CURVE_DEXES
+
+
+def universe_check(pair: dict, u: dict, now: float | None = None) -> str | None:
+    """None if the pair fits universe profile ``u``, else the reason it does not."""
     age = pair_age_hours(pair, now)
     if age is None:
         return "unknown pair age"
@@ -86,17 +93,35 @@ def universe_check(pair: dict, cfg: dict, now: float | None = None) -> str | Non
     if liq < u["min_liquidity_usd"]:
         return f"liquidity ${liq:,.0f} < ${u['min_liquidity_usd']:,}"
     v5 = f((pair.get("volume") or {}).get("m5"))
-    if v5 < u["min_volume_m5_usd"]:
+    if v5 < u.get("min_volume_m5_usd", 0):
         return f"5m volume ${v5:,.0f} < ${u['min_volume_m5_usd']:,}"
     mcap = f(pair.get("marketCap") or pair.get("fdv"))
     if mcap and mcap > u["max_mcap_usd"]:
         return f"mcap ${mcap:,.0f} too large"
+    if u.get("min_mcap_usd") and mcap < u["min_mcap_usd"]:
+        return f"mcap ${mcap:,.0f} < ${u['min_mcap_usd']:,}"
     dex = pair.get("dexId", "")
     if u.get("dex_ids") and dex not in u["dex_ids"]:
         return f"dex {dex} not in universe"
     if not f(pair.get("priceUsd")):
         return "no USD price"
     return None
+
+
+def pick_strategy(pair: dict, cfg: dict, now: float | None = None) -> tuple[str | None, str]:
+    """First enabled scanner strategy (fresh, then migrated) whose universe the pair fits."""
+    reasons = []
+    for name in ("fresh", "migrated"):
+        if not cfg["strategies"].get(name):
+            continue
+        if name == "migrated" and not is_migrated(pair):
+            reasons.append("migrated: still on bonding curve")
+            continue
+        why = universe_check(pair, cfg["universe"][name], now)
+        if why is None:
+            return name, ""
+        reasons.append(f"{name}: {why}")
+    return None, "; ".join(reasons) or "no scanner strategy enabled"
 
 
 def momentum_signals(pair: dict, cfg: dict, now: float | None = None) -> list[str]:
@@ -265,7 +290,11 @@ class PaperBook:
             return eq
 
     # ------------------------------------------------------------- entry
-    def open(self, pair: dict, size_eur: float, signals: list[str], reason: str, safety: dict | None) -> dict | None:
+    def exit_rules(self, strategy: str | None) -> dict:
+        return {**self.cfg["executor"], **(self.cfg.get("exits", {}).get(strategy or "", {}))}
+
+    def open(self, pair: dict, size_eur: float, signals: list[str], reason: str, safety: dict | None,
+             strategy: str = "fresh", copied_from: str | None = None) -> dict | None:
         ex = self.cfg["executor"]
         price = f(pair.get("priceUsd"))
         liq = f((pair.get("liquidity") or {}).get("usd"))
@@ -291,11 +320,12 @@ class PaperBook:
                 "tokens": tokens, "tokens_initial": tokens, "cost_eur": size_eur, "proceeds_eur": 0.0,
                 "opened_at": time.time(), "tp_hit": 0, "entry_liq": liq, "last_liq": liq,
                 "signals": signals, "reason": reason, "slip_pct": round(slip, 2), "fees_usd": round(fee_usd, 4),
+                "strategy": strategy, "copied_from": copied_from,
                 "creator": (safety or {}).get("creator"), "creator_balance": (safety or {}).get("creator_balance"),
             }
             self.positions[pos["id"]] = pos
             eq = self.equity()
-            self.j.log("ENTER", reason, sym, mint, size_eur=round(size_eur, 2),
+            self.j.log("ENTER", f"[{strategy}] {reason}", sym, mint, size_eur=round(size_eur, 2),
                        pct=round(size_eur / max(eq, 1e-9) * 100), price=price, slip=round(slip, 2),
                        signals=",".join(signals))
             return pos
@@ -322,7 +352,8 @@ class PaperBook:
             "mint": pos["mint"], "symbol": pos["symbol"], "opened_at": pos["opened_at"], "closed_at": time.time(),
             "cost_eur": round(pos["cost_eur"], 4), "proceeds_eur": round(pos["proceeds_eur"], 4),
             "pnl_eur": round(pnl, 4), "pnl_pct": round(pnl / pos["cost_eur"] * 100, 2) if pos["cost_eur"] else 0,
-            "exit_reason": why, "signals": pos["signals"], "max_x": round(pos["peak_price"] / pos["entry_price"], 2),
+            "exit_reason": why, "signals": pos["signals"], "strategy": pos.get("strategy"),
+            "copied_from": pos.get("copied_from"), "max_x": round(pos["peak_price"] / pos["entry_price"], 2),
             "url": pos.get("url"),
         }
         self.trades.append(t)
@@ -335,12 +366,12 @@ class PaperBook:
 
     def update(self, pos_id: str, price: float, liq: float, dev_sold: bool = False, now: float | None = None) -> str | None:
         """Apply exit rules to one position at a new price. Returns the exit reason if fully closed."""
-        ex = self.cfg["executor"]
         now = now or time.time()
         with self.lock:
             pos = self.positions.get(pos_id)
             if not pos or price <= 0:
                 return None
+            ex = self.exit_rules(pos.get("strategy"))
             pos["last_price"], pos["last_liq"] = price, liq
             pos["peak_price"] = max(pos["peak_price"], price)
             x = price / pos["entry_price"]

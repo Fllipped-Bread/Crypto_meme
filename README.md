@@ -1,6 +1,6 @@
 # MemeBot Terminal
 
-A Windows app (`MemeBot.exe`) that scans new Solana meme coins on live data and **paper-trades** them with a 50 € starting balance. It works like the "overnight bot" setup: six agents, each with one job, and a live dashboard in your browser that shows why every decision was made.
+A Windows app (`MemeBot.exe`) that **copies proven wallets** and trades **migrated** Solana meme coins on live data, as **paper trades** with a 50 € starting balance. It works like the "overnight bot" setup: six agents, each with one job, and a live dashboard in your browser that shows why every decision was made.
 
 > **Paper mode only.** No wallet is connected and no real money moves. All market data is live, and every trade is a simulated fill at the live price, with Solana fees and slippage included.
 
@@ -13,15 +13,21 @@ SCANNER  ->  RUG CHECK  ->  SIZER  ->  EXECUTOR  ->  LOGGER  ->  EQUITY
                     + COPY WALLETS (small wallets sized like yours, no whales)
 ```
 
-## Getting the .exe
+## Put it on your desktop and run it
 
-1. Open the repo on GitHub, go to the **Actions** tab, and open the latest **Build Windows .exe** run.
-2. Download the **MemeBot-windows** artifact (a zip containing `MemeBot.exe`).
-3. Put `MemeBot.exe` in its own folder and double-click it. Your browser opens the dashboard at `http://127.0.0.1:8765`.
+Open **PowerShell** (Start menu, type `powershell`, press Enter), paste this line and press Enter:
 
-Windows SmartScreen may warn you because the .exe is unsigned. Click "More info", then "Run anyway".
+```powershell
+irm https://raw.githubusercontent.com/Fllipped-Bread/Crypto_meme/claude/brave-hopper-etvpla/install-desktop.ps1 | iex
+```
 
-On first launch the app creates these files next to the .exe:
+This creates a `MemeBot` folder and a `MemeBot` shortcut on your desktop, then starts the bot. Your browser opens the dashboard at `http://127.0.0.1:8765`. Later, double-click the shortcut to start it. Run the same line again to update; your settings and paper history are kept.
+
+If Windows SmartScreen warns you (the .exe is unsigned), click "More info", then "Run anyway".
+
+Manual download instead: <https://github.com/Fllipped-Bread/Crypto_meme/releases/download/latest/MemeBot.exe>. Put it in its own folder and double-click it.
+
+The app keeps its files next to the .exe:
 
 | File | What it is |
 |---|---|
@@ -35,9 +41,10 @@ To run from source instead: `pip install -r requirements.txt`, then `python run.
 
 | Source | Used for | Key needed |
 |---|---|---|
-| **DexScreener** | new token profiles, boosts (paid promotion / KOL proxy), price, liquidity, 5m/1h volume, buys/sells, pair age | no |
+| **Jupiter** | trending tokens (1h) | no |
+| **DexScreener** | token profiles, boosts (paid promotion / KOL proxy), price, liquidity, 5m/1h volume, buys/sells, pair age | no |
 | **pump.fun** | live coins, graduated (migrated) coins, king-of-the-hill | no (unofficial API) |
-| **GMGN** | 1h swap rank, holder count, smart-money and KOL counts | no (unofficial; Cloudflare often blocks it, and the bot carries on without it) |
+| **GMGN** | top-PnL wallet leaderboard, 1h swap rank, holder count, smart-money and KOL counts | no (unofficial; Cloudflare often blocks it, and the bot carries on without it) |
 | **RugCheck.xyz** | mint/freeze authority, top-10 holders, dev %, LP locked/burned, insider clusters, holder count | no |
 | **Jupiter** | sell-quote simulation (no route = honeypot) | no |
 | **Solana RPC** | copy-wallet trades, wallet balances, fallback safety data | no (public RPC is slow; a free Helius URL is much better) |
@@ -50,11 +57,17 @@ To run from source instead: `pip install -r requirements.txt`, then `python run.
 
 The **data sources** panel shows each source as green or red. Hover over a red one to see why it failed. If a source is down, the bot keeps running on the others.
 
-## The rules (defaults, all editable in `config.json`)
+## Strategies
 
-**Universe**
-- Pair launched or migrated in the last **6 h** (pump.fun, PumpSwap, Raydium, Meteora, Orca)
-- Liquidity ≥ **$40k**, 5-minute volume ≥ **$25k**, ≥ **300 holders**
+Set in `config.json` under `"strategies"`:
+
+| Strategy | Default | What it trades |
+|---|---|---|
+| `copy` | **on** | Enters when a proven wallet (good win rate and PnL, small enough to match you) buys, and exits when that wallet sells. |
+| `migrated` | **on** | Coins that graduated from pump.fun or another launchpad into a real DEX pool (PumpSwap, Raydium, Meteora, Orca) in the last 7 days. Needs mcap ≥ $150k, liquidity ≥ $30k and ≥ 500 holders. Coins still on a bonding curve are skipped. |
+| `fresh` | off | Brand-new pairs under 6 hours old (the original overnight setup) |
+
+## The rules (defaults, all editable in `config.json`)
 
 **Scanner signals** (a token needs **2 or more** to be flagged)
 - `volume_spike`: 5m volume is more than 5× the average 5-minute volume of the last hour
@@ -63,6 +76,8 @@ The **data sources** panel shows each source as green or red. Hover over a red o
 - `copy_wallet` / `smart_cluster`: 1 fitted copy wallet bought in the last 10 minutes (3 or more counts double)
 - `smart_money`: GMGN smart-money count of 3 or more
 - `kol_boost`: DexScreener boost or GMGN KOL
+- `trending`: on Jupiter's 1h trending list
+- `fresh_migration`: graduated from pump.fun less than 1 hour ago
 - `news` / `x_mentions`: token named in headlines, or 50+ tweets in the last hour
 - No chasing: skip a coin that is already up 300% in the last hour and still rising
 
@@ -82,31 +97,44 @@ The **data sources** panel shows each source as green or red. Hover over a red o
 - Costs per swap: DEX fee (pump.fun 1.25%, PumpSwap 0.3%, Raydium 0.25%), network + priority fee, and price impact from the pool's liquidity
 - Take-profit ladder: sell **40% at 2x**, **30% at 4x**; the last 30% runs with a **25% trailing stop**
 - Hard stop **−12%**. Time stop **25 min** if 2x hasn't been reached.
+- Migrated trades: hard stop −15%, time stop 90 min. Copy trades: hard stop −20%, time stop 6 h, plus an exit when the copied wallet sells.
 - Exits at once if liquidity drops 40% (LP pulled) or the dev wallet sells
 
 **Equity**
 - If equity falls 30% from the day's peak, new entries pause until the next day
 - A recap prints at 07:00 (or click **Recap**): start vs end balance, best and worst trade, total trades, top 3 coins
 
-## Copy trading: wallets that fit your balance
+## Copy trading: good wallets that fit your balance
 
-The wallet you gave (`BdLxn8cYq3FHNUqEN9dE2CYz2wc7BwCjL3gDrpsQRZ7y`) is tracked by default. Add more from the dashboard.
+The bot doesn't take a win rate on anyone's word, GMGN's included. It reads each wallet's own trades from the chain (up to 80 past transactions), then works out:
 
-Each wallet is profiled from its own on-chain swaps:
-- **whale**: more than 60 SOL in the wallet, or a median buy over 3 SOL. Ignored.
-- **dust**: median buy under 0.02 SOL. Ignored.
-- **copy**: small wallet whose trade size fits yours. Its buys become signals.
-- **watch**: an auto-discovered wallet that is still being scored
+- **closed trades**: coins it bought and then sold (90% or more of the position)
+- **win rate**: share of closed trades that returned more SOL than they cost
+- **PnL**: total SOL made or lost on closed trades
+- median buy size, median hold time, trades per day, and SOL balance
 
-**Auto-discover**: when one of the bot's trades runs (finishes its ladder or hits the trailing stop), the bot reads the earliest buyers it can reach in that pool and starts watching them. Every buy a wallet makes is scored 30 minutes later (up 10% or more counts as a hit). After 5 scored buys with a hit rate of 50% or more, the wallet is promoted to **copy**.
+| Status | Meaning | Copied? |
+|---|---|---|
+| **copy** | win rate ≥ 55%, PnL ≥ +0.5 SOL, at least 6 closed trades | yes |
+| watch | fewer than 6 closed trades so far | not yet |
+| poor | enough trades, but win rate or PnL below the bar | no |
+| whale | more than 60 SOL, or median buy over 3 SOL (doesn't fit a 50 € account) | no |
+| bot | more than 300 trades a day, or holds for under 20 s (sniper / MEV) | no |
+| dust | median buy under 0.02 SOL | no |
 
-`copy_mode`:
-- `"signal"` (default): a copy-wallet buy counts as one scanner signal, so another signal is still needed
-- `"mirror"`: enter when a copy wallet buys (rug check still required), sized to the **same % of balance** the wallet used. If it put 5% of its SOL in, you put 5% of your euros in (clamped to 20–40%).
+**Where wallets come from**
+- Your list. `BdLxn8cYq3FHNUqEN9dE2CYz2wc7BwCjL3gDrpsQRZ7y` is included by default; add more from the dashboard. Your own wallets are copied until their history proves them poor.
+- The **GMGN 7-day PnL leaderboard** (hourly, when GMGN answers). Whales and low win rates are dropped first, and the rest are verified on-chain.
+- **Traders of coins that ran**: when a migrated coin is up 100% or more in 6 hours, the bot collects wallets that traded it and profiles them.
+
+**Mirroring** (`copy_mode: "mirror"`, the default)
+- When a **copy** wallet buys, the bot enters too, if the coin passes the rug check and has at least $20k liquidity. Buys noticed more than 3 minutes late are skipped.
+- The bot puts in the **same share of its balance** that the wallet used: 5% of the wallet's SOL means 5% of your euros, clamped to 20–40% and at least 5 €.
+- When that wallet sells the coin, the bot sells too.
 
 ## Tips
 
-- Set `"solana_rpc"` to a free [Helius](https://www.helius.dev/) RPC URL. The public RPC is heavily rate-limited, which makes wallet tracking slow.
+- Set `"solana_rpc"` to a free [Helius](https://www.helius.dev/) RPC URL. **Strongly recommended for copy trading.** The public RPC is heavily rate-limited, so profiling wallets and noticing their buys is slow.
 - To trade only overnight, set `"active_hours": [23, 7]`.
 - **Reset paper** on the dashboard starts over with any balance.
 
@@ -130,4 +158,4 @@ memebot/
 tests/           pytest
 ```
 
-Run the tests with `pytest -q`. Every push builds `MemeBot.exe` on GitHub Actions. Pushing a tag like `v1.0.0` also attaches the .exe to a GitHub Release.
+Run the tests with `pytest -q`. Every push builds `MemeBot.exe` on GitHub Actions. Each push also updates the `latest` download that `install-desktop.ps1` uses.

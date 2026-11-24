@@ -74,7 +74,7 @@ svg{display:block;width:100%}
     <div>
       <h1><b>MemeBot</b> Terminal <span class="tag orange">v1.0 · paper</span></h1>
       <div style="margin-top:4px"><span id="dot" class="dot"></span><span id="status">connecting…</span> · <span id="clock" class="m"></span></div>
-      <div style="margin-top:6px"><span class="tag green">live data</span><span class="tag">solana · fresh memes</span><span class="tag" id="fxinfo"></span></div>
+      <div style="margin-top:6px"><span class="tag green">live data</span><span class="tag" id="strats">solana</span><span class="tag" id="fxinfo"></span></div>
     </div>
     <div class="kpis">
       <div class="kpi"><div class="v" id="eq">€–</div><div class="l">equity</div></div>
@@ -129,17 +129,17 @@ svg{display:block;width:100%}
       </div>
 
       <div class="card">
-        <div class="h"><span>scanner · candidates (dexscreener + pump.fun + gmgn + wallets)</span><span></span></div>
+        <div class="h"><span>scanner · candidates (dexscreener + pump.fun + gmgn + jupiter + wallets)</span><span></span></div>
         <div class="scroll" style="max-height:460px"><table>
-          <thead><tr><th>token</th><th>stage</th><th>age</th><th>liq</th><th>vol 5m</th><th>1h</th><th>holders</th><th>signals</th><th>note</th><th>links</th></tr></thead>
+          <thead><tr><th>token</th><th>stage</th><th>strategy</th><th>age</th><th>liq</th><th>vol 5m</th><th>1h</th><th>holders</th><th>signals</th><th>note</th><th>links</th></tr></thead>
           <tbody id="cands"></tbody></table></div>
       </div>
 
       <div class="row r2">
         <div class="card">
-          <div class="h"><span>copy wallets · fitted to your balance</span><span id="wcount"></span></div>
+          <div class="h"><span>copy wallets · good win rate + PnL, fitted to your balance</span><span id="wcount"></span></div>
           <div style="display:flex;gap:6px;margin-bottom:8px"><input id="waddr" placeholder="add a Solana wallet address"><button id="wadd">Track</button></div>
-          <div class="scroll" style="max-height:300px"><table><thead><tr><th>wallet</th><th>status</th><th>SOL</th><th>med buy</th><th>hit</th><th>source</th><th></th></tr></thead><tbody id="wallets"></tbody></table></div>
+          <div class="scroll" style="max-height:300px"><table><thead><tr><th>wallet</th><th>status</th><th>win</th><th>PnL</th><th>closed</th><th>SOL</th><th>buy</th><th>source</th><th></th></tr></thead><tbody id="wallets"></tbody></table></div>
         </div>
         <div class="card">
           <div class="h"><span>trade history</span><span></span></div>
@@ -207,6 +207,7 @@ function render(s) {
   $("clock").textContent = new Date(s.now*1000).toLocaleTimeString();
   $("fxinfo").textContent = `SOL $${Number(st.sol_usd).toFixed(2)} · 1€ = $${Number(st.usd_per_eur).toFixed(3)}`;
   $("eq").textContent = eur(st.equity);
+  $("strats").textContent = "solana · " + Object.entries(s.config.strategies).filter(([k, v]) => v).map(([k]) => k).join(" + ");
   $("pnl").innerHTML = `<span class="${st.pnl_eur >= 0 ? "g" : "r"}">${st.pnl_eur >= 0 ? "+" : ""}${st.pnl_pct.toFixed(1)}%</span>`;
   $("trades").textContent = st.trades; $("wins").textContent = st.wins; $("losses").textContent = st.losses;
 
@@ -230,7 +231,7 @@ function render(s) {
   $("lastclose").innerHTML = lc ? `<span class="${lc.pnl_eur >= 0 ? "g" : "r"}">${lc.pnl_eur >= 0 ? "+" : ""}${eur(lc.pnl_eur)}</span>` : "–";
 
   $("npos").textContent = `${s.positions.length} / ${s.config.sizer.max_open_positions}`;
-  $("positions").innerHTML = s.positions.map(p => `<tr><td><b>$${esc(p.symbol)}</b> <span class="m">${esc(p.dex)}</span></td>
+  $("positions").innerHTML = s.positions.map(p => `<tr><td><b>$${esc(p.symbol)}</b> <span class="m">${esc(p.strategy || "")}${p.copied_from ? " · " + esc(short(p.copied_from)) : ""}</span></td>
     <td class="${p.x >= 1 ? "g" : "r"}">${p.x.toFixed(2)}x</td><td>${eur(p.value_eur)}</td><td>${eur(p.cost_eur)}</td>
     <td>${ago(p.opened_at)}</td><td>${p.tp_hit}/${s.config.executor.take_profit.length}</td>
     <td><button data-close="${esc(p.id)}">close</button></td></tr>`).join("") || `<tr><td class="m" colspan="7">flat · waiting</td></tr>`;
@@ -248,16 +249,19 @@ function render(s) {
 
   $("cands").innerHTML = s.candidates.map(c => `<tr><td><b>$${esc(c.symbol)}</b><br><span class="m">${esc((c.name||"").slice(0,18))}</span></td>
     <td><span class="k ${c.stage === "entered" ? "EXIT" : c.stage === "flagged" ? "ENTER" : c.stage === "rejected" ? "PAUSE" : "SKIP"}">${esc(c.stage)}</span></td>
+    <td class="m">${esc(c.strategy || (c.migrated ? "–" : "bonding"))}</td>
     <td>${c.age_h == null ? "?" : c.age_h.toFixed(1) + "h"}</td><td>${usd(c.liq)}</td><td>${usd(c.v5)}</td>
     <td class="${c.h1 >= 0 ? "g" : "r"}">${c.h1.toFixed(0)}%</td><td>${c.holders ?? (c.safety && c.safety.holders) ?? "–"}</td>
     <td>${c.signals.map(x => `<span class="sig">${esc(x)}</span>`).join("")}</td>
     <td style="white-space:normal;max-width:260px" class="m">${esc(c.note)}</td><td>${links(c.mint, c.symbol, c.url)}</td></tr>`).join("");
 
   $("wcount").textContent = `${s.wallets.filter(w => w.status === "copy").length} copyable / ${s.wallets.length}`;
-  const wcol = {copy: "g", watch: "o", whale: "r", dust: "m", new: "m"};
+  const wcol = {copy: "g", watch: "o", whale: "r", dust: "m", new: "m", poor: "r", bot: "r"};
   $("wallets").innerHTML = s.wallets.map(w => `<tr><td><a href="https://gmgn.ai/sol/address/${esc(w.address)}" target="_blank" rel="noopener">${esc(short(w.address))}</a></td>
-    <td class="${wcol[w.status] || "m"}">${esc(w.status)}</td><td>${w.sol ?? "–"}</td><td>${w.median_buy ?? "–"}</td>
-    <td>${w.obs ? Math.round(w.hits / w.obs * 100) + "% (" + w.obs + ")" : "–"}</td><td class="m">${esc(w.source)}</td>
+    <td class="${wcol[w.status] || "m"}">${esc(w.profiled ? w.status : "profiling")}</td>
+    <td>${w.winrate == null ? "–" : Math.round(w.winrate * 100) + "%"}</td>
+    <td class="${(w.pnl_sol || 0) >= 0 ? "g" : "r"}">${w.pnl_sol == null ? "–" : (w.pnl_sol >= 0 ? "+" : "") + Number(w.pnl_sol).toFixed(2) + " SOL"}</td>
+    <td>${w.closed ?? "–"}</td><td>${w.sol ?? "–"}</td><td>${w.median_buy ?? "–"}</td><td class="m">${esc(w.source)}</td>
     <td><button data-wrm="${esc(w.address)}">×</button></td></tr>`).join("");
 
   $("history").innerHTML = s.trades.slice().reverse().map(t => `<tr><td><b>$${esc(t.symbol)}</b></td>
